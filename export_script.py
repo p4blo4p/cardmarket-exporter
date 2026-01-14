@@ -7,25 +7,29 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 
-# Configuración de argumentos
-parser = argparse.ArgumentParser(description='Cardmarket Exporter para Termux')
-parser.add_argument('--year', help='Año (ej. 2025)')
+# --- CONFIGURACIÓN DE ARGUMENTOS ---
+parser = argparse.ArgumentParser(description='Cardmarket Exporter Pro')
+parser.add_argument('--year', help='Año filtro (ej. 2025)')
 parser.add_argument('--include-purchases', action='store_true', help='Exportar Compras')
 parser.add_argument('--include-sales', action='store_true', help='Exportar Ventas')
 args = parser.parse_args()
 
-USER_NAME = os.environ.get('CM_USERNAME')
-PASSWORD = os.environ.get('CM_PASSWORD')
-# MÉTODO RECOMENDADO: Copia tu cookie 'PHPSESSID' desde el navegador
-CM_COOKIE = os.environ.get('CM_COOKIE') 
+# --- VARIABLES DE ENTORNO ---
+# RECOMENDADO: Solo necesitas el valor de PHPSESSID (ej: 4h6g...)
+CM_PHPSESSID = os.environ.get('CM_PHPSESSID')
+# Opcional: Cookie completa
+CM_COOKIE = os.environ.get('CM_COOKIE')
+# IMPORTANTE: Este User-Agent debe ser similar al de tu navegador móvil
+USER_AGENT = 'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36'
 
 CSV_FILE = 'cardmarket_export.csv'
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'User-Agent': USER_AGENT,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
     'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
 }
 
 def load_existing_data():
@@ -39,7 +43,7 @@ def load_existing_data():
                     if row.get('Order ID'):
                         existing_ids.add(row.get('Order ID'))
                         rows.append(row)
-            print(f"[*] Registros previos cargados: {len(existing_ids)}")
+            print(f"[*] Datos previos: {len(existing_ids)} pedidos cargados.")
         except: pass
     return existing_ids, rows
 
@@ -52,20 +56,20 @@ def scrape_section(session, url, start_dt, existing_ids):
         paginated_url = f"{url}?site={page_num}"
         try:
             response = session.get(paginated_url, headers=HEADERS, timeout=15)
-            if response.status_code == 401:
-                print("[!] Error 401: Sesión no válida o expirada.")
+            if response.status_code != 200:
+                print(f"[!] Error {response.status_code} en página {page_num}.")
                 break
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Verificar si realmente estamos dentro
-            if not any('Logout' in a.get('href', '') for a in soup.find_all('a', href=True)):
-                print("[!] No parece haber una sesión activa en esta página.")
+            # Verificación de Logout (indicador de sesión activa)
+            if 'Logout' not in response.text:
+                print(f"[!] Sesión perdida en página {page_num}. Verifica tu cookie.")
                 break
 
             table_body = soup.select_one('div.table-body')
             if not table_body:
-                print("[*] No se encontraron datos en esta página.")
+                print("[*] Fin de resultados o sección vacía.")
                 break
                 
             rows = table_body.select('div.row')
@@ -87,7 +91,7 @@ def scrape_section(session, url, start_dt, existing_ids):
                 try:
                     row_dt = datetime.strptime(date_str.split(' ')[0], '%d.%m.%y')
                     if start_dt and row_dt < start_dt:
-                        print(f"[*] Fecha límite alcanzada ({date_str}).")
+                        print(f"[*] Alcanzado límite de fecha ({date_str}). Parando.")
                         return new_data
                 except: pass
 
@@ -105,10 +109,10 @@ def scrape_section(session, url, start_dt, existing_ids):
                 })
                 existing_ids.add(order_id)
 
-            print(f"[*] Página {page_num}: {len(new_data)} nuevos pedidos.")
+            print(f"[*] Página {page_num}: {len(new_data)} pedidos nuevos.")
 
-            if page_duplicates == len(rows) and len(rows) > 0:
-                print("[*] Sincronización completa.")
+            if page_duplicates == len(rows):
+                print("[*] Todos los pedidos de esta página ya existen. Sincronización terminada.")
                 break
 
             if not soup.select_one('a[aria-label="Next Page"]'):
@@ -117,48 +121,48 @@ def scrape_section(session, url, start_dt, existing_ids):
             page_num += 1
             time.sleep(2)
         except Exception as e:
-            print(f"[!] Error en scrap: {e}")
+            print(f"[!] Error crítico: {e}")
             break
 
     return new_data
 
 def run():
+    if not CM_PHPSESSID and not CM_COOKIE:
+        print("[!] ERROR: Debes configurar CM_PHPSESSID o CM_COOKIE.")
+        print("[!] Revisa la pestaña 'Guía de Sesión' en la web.")
+        return
+
     existing_ids, all_rows = load_existing_data()
     start_dt = datetime(int(args.year), 1, 1) if args.year else None
 
     with requests.Session() as s:
-        if CM_COOKIE:
-            print("[*] Usando Cookie de sesión manual...")
-            # Formato esperado: "PHPSESSID=xxxxxxx; ..."
+        # Configurar cookies
+        if CM_PHPSESSID:
+            s.cookies.set('PHPSESSID', CM_PHPSESSID, domain='.cardmarket.com')
+        elif CM_COOKIE:
             s.headers.update({'Cookie': CM_COOKIE})
-        else:
-            print("[*] Intentando Login automático (Tradicional)...")
-            login_url = "https://www.cardmarket.com/en/Magic/MainPage/Login"
-            r = s.get(login_url, headers=HEADERS)
-            soup = BeautifulSoup(r.text, 'html.parser')
-            form = soup.find('form')
+
+        print("[*] Validando sesión...")
+        try:
+            # Visitamos la página principal de Magic para verificar login
+            check = s.get("https://www.cardmarket.com/en/Magic", headers=HEADERS, timeout=10)
+            soup = BeautifulSoup(check.text, 'html.parser')
             
-            if not form:
-                print("[!] Error: No se encontró el formulario. Cardmarket está usando Login por JS.")
-                print("[!] POR FAVOR: Usa el método de CM_COOKIE (ver README).")
+            title = soup.title.string.strip() if soup.title else "Sin título"
+            
+            if 'Logout' in check.text:
+                print(f"[+] SESIÓN CONFIRMADA. Bienvenido.")
+            else:
+                print(f"[!] SESIÓN NO ACTIVA.")
+                print(f"[*] Título página: {title}")
+                if "Attention Required" in title or "Cloudflare" in title:
+                    print("[!] BLOQUEO: Cloudflare ha detectado el script. Prueba a usar DATOS MÓVILES en Termux.")
+                else:
+                    print("[!] ERROR: Tu PHPSESSID ha expirado o es incorrecto.")
                 return
-
-            payload = {tag.get('name'): tag.get('value', '') for tag in form.find_all('input') if tag.get('name')}
-            payload['_username'] = USER_NAME
-            payload['_password'] = PASSWORD
-            
-            action = form.get('action', login_url)
-            if not action.startswith('http'): action = "https://www.cardmarket.com" + action
-            
-            s.post(action, data=payload, headers={**HEADERS, 'Referer': login_url})
-
-        # Validar sesión visitando el perfil
-        check = s.get("https://www.cardmarket.com/en/Magic", headers=HEADERS)
-        if 'Logout' not in check.text:
-            print("[!] SESIÓN NO ACTIVA. Si el login automático falló, usa el método CM_COOKIE.")
+        except Exception as e:
+            print(f"[!] Error de conexión: {e}")
             return
-        
-        print("[+] Sesión confirmada.")
 
         new_items = []
         if args.include_purchases:
@@ -173,9 +177,9 @@ def run():
                 writer = csv.DictWriter(f, fieldnames=keys)
                 writer.writeheader()
                 writer.writerows(all_rows)
-            print(f"[+] Finalizado. {len(new_items)} nuevos pedidos guardados.")
+            print(f"[+] ÉXITO: {len(new_items)} pedidos nuevos guardados en {CSV_FILE}.")
         else:
-            print("[*] No hay pedidos nuevos.")
+            print("[*] No hay pedidos nuevos para añadir.")
 
 if __name__ == "__main__":
     run()
