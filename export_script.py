@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 
 # --- CONFIGURACIÓN ---
-parser = argparse.ArgumentParser(description='Cardmarket Exporter Pro v3.1')
+parser = argparse.ArgumentParser(description='Cardmarket Exporter Pro v3.2')
 parser.add_argument('--year', help='Año filtro (ej. 2025)')
 parser.add_argument('--include-purchases', action='store_true', help='Exportar Compras')
 parser.add_argument('--include-sales', action='store_true', help='Exportar Ventas')
@@ -17,7 +17,6 @@ parser.add_argument('--debug', action='store_true', help='Mostrar cabeceras envi
 args = parser.parse_args()
 
 CM_COOKIE = os.environ.get('CM_COOKIE', '').strip()
-CM_PHPSESSID = os.environ.get('CM_PHPSESSID', '').strip()
 CM_USER_AGENT = os.environ.get('CM_USER_AGENT', '').strip()
 
 CSV_FILE = 'cardmarket_export.csv'
@@ -30,44 +29,33 @@ def get_headers(ua, cookie_str):
         'Connection': 'keep-alive',
         'Cookie': cookie_str,
         'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
     }
 
 def print_debug_log(response):
-    """Imprime un diagnóstico detallado en la terminal"""
     print("-" * 50)
-    print("DEBUG LOG - DETALLES DE LA RESPUESTA")
+    print("DIAGNÓSTICO DE ERROR (v3.2)")
     print("-" * 50)
-    print(f"URL: {response.url}")
     print(f"Estado HTTP: {response.status_code}")
     
-    # Extraer Título de la página
-    title = "No encontrado"
     soup = BeautifulSoup(response.text, 'html.parser')
-    if soup.title:
-        title = soup.title.string.strip()
-    print(f"Título HTML: {title}")
+    title = soup.title.string.strip() if soup.title else "Sin título"
+    print(f"Título de la página: {title}")
 
-    # Detectar Cloudflare o Bloqueos
-    content_lower = response.text.lower()
-    if "cloudflare" in content_lower:
-        print("Detección: [!] CLOUDFLARE DETECTADO")
-    if "attention required" in content_lower:
-        print("Detección: [!] CAPTCHA O ATENCIÓN REQUERIDA")
-    if "logout" in content_lower:
-        print("Sesión: [OK] El botón de Logout está presente.")
-    else:
-        print("Sesión: [X] NO LOGUEADO.")
-
-    # Mostrar fragmento del cuerpo si no hay login
-    if 'Logout' not in response.text:
-        print("Fragmento del cuerpo (primeros 300 caracteres):")
-        clean_text = re.sub(r'\s+', ' ', response.text[:300]).strip()
-        print(f"--- {clean_text} ---")
+    if response.status_code == 401 or "Login" in title:
+        print("[!] MOTIVO: SESIÓN NO VÁLIDA (401)")
+        print("    Tus cookies no tienen el PHPSESSID o ha caducado.")
+        if "PHPSESSID" not in CM_COOKIE:
+            print("    FALLO DETECTADO: La variable CM_COOKIE no contiene 'PHPSESSID'.")
     
+    if "cloudflare" in response.text.lower() or response.status_code == 403:
+        print("[!] MOTIVO: BLOQUEO DE CLOUDFLARE (403)")
+        print("    La IP o el User-Agent no coinciden con la cookie.")
+
+    print("
+Cabeceras enviadas (Resumen):")
+    print(f"UA: {CM_USER_AGENT[:50]}...")
+    print(f"Cookie (inicio): {CM_COOKIE[:40]}...")
     print("-" * 50)
 
 def load_existing_data():
@@ -85,102 +73,99 @@ def load_existing_data():
     return existing_ids, rows
 
 def scrape_section(session, url, start_dt, existing_ids, ua, cookie_str):
-    print(f"[*] Escaneando: {url}")
+    print(f"[*] Accediendo a: {url}")
     new_data = []
     page_num = 1
     
     while True:
         paginated_url = f"{url}?site={page_num}"
         headers = get_headers(ua, cookie_str)
-        response = session.get(paginated_url, headers=headers, timeout=15)
-        
-        if 'Logout' not in response.text:
-            print(f"[!] ERROR: Sesión perdida en página {page_num}.")
-            print_debug_log(response)
-            return new_data
-
-        soup = BeautifulSoup(response.text, 'html.parser')
-        table_body = soup.select_one('div.table-body')
-        if not table_body: break
+        try:
+            response = session.get(paginated_url, headers=headers, timeout=15)
             
-        rows = table_body.select('div.row')
-        if not rows: break
-
-        for row in rows:
-            id_el = row.select_one('.col-orderId')
-            if not id_el: continue
-            order_id = id_el.get_text(strip=True)
-
-            if order_id in existing_ids:
+            if 'Logout' not in response.text:
+                print(f"[!] ERROR: Sesión perdida en página {page_num}.")
+                print_debug_log(response)
                 return new_data
 
-            date_el = row.select_one('.col-date')
-            date_str = date_el.get_text(strip=True) if date_el else ""
-            
-            try:
-                row_dt = datetime.strptime(date_str.split(' ')[0], '%d.%m.%y')
-                if start_dt and row_dt < start_dt:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            table_body = soup.select_one('div.table-body')
+            if not table_body: break
+                
+            rows = table_body.select('div.row')
+            if not rows: break
+
+            for row in rows:
+                id_el = row.select_one('.col-orderId')
+                if not id_el: continue
+                order_id = id_el.get_text(strip=True)
+
+                if order_id in existing_ids:
                     return new_data
-            except: pass
 
-            status = row.select_one('.col-status').get_text(strip=True) if row.select_one('.col-status') else ""
-            user = row.select_one('.col-user').get_text(strip=True) if row.select_one('.col-user') else ""
-            total = row.select_one('.col-total').get_text(strip=True) if row.select_one('.col-total') else ""
+                date_el = row.select_one('.col-date')
+                date_str = date_el.get_text(strip=True) if date_el else ""
+                
+                try:
+                    row_dt = datetime.strptime(date_str.split(' ')[0], '%d.%m.%y')
+                    if start_dt and row_dt < start_dt:
+                        return new_data
+                except: pass
 
-            new_data.append({
-                'Order ID': order_id, 'Date': date_str, 'User': user, 
-                'Status': status, 'Total': total, 
-                'Type': 'Purchase' if 'Received' in url else 'Sale'
-            })
-            existing_ids.add(order_id)
+                status = row.select_one('.col-status').get_text(strip=True) if row.select_one('.col-status') else ""
+                user = row.select_one('.col-user').get_text(strip=True) if row.select_one('.col-user') else ""
+                total = row.select_one('.col-total').get_text(strip=True) if row.select_one('.col-total') else ""
 
-        print(f"[*] Página {page_num}: {len(new_data)} pedidos nuevos.")
-        if not soup.select_one('a[aria-label="Next Page"]'): break
-        page_num += 1
-        time.sleep(2)
-        
+                new_data.append({
+                    'Order ID': order_id, 'Date': date_str, 'User': user, 
+                    'Status': status, 'Total': total, 
+                    'Type': 'Purchase' if 'Received' in url else 'Sale'
+                })
+                existing_ids.add(order_id)
+
+            print(f"[*] Página {page_num}: {len(new_data)} nuevos.")
+            if not soup.select_one('a[aria-label="Next Page"]'): break
+            page_num += 1
+            time.sleep(2)
+        except Exception as e:
+            print(f"[!] Error: {e}")
+            break
+            
     return new_data
 
 def run():
-    cookie_to_use = CM_COOKIE if CM_COOKIE else f"PHPSESSID={CM_PHPSESSID}"
-    ua_to_use = CM_USER_AGENT
-    
-    if not CM_PHPSESSID and not CM_COOKIE:
-        print("[!] ERROR: No has definido CM_COOKIE ni CM_PHPSESSID.")
-        return
-    if not ua_to_use:
-        print("[!] ERROR: CM_USER_AGENT es obligatorio.")
+    if not CM_COOKIE or not CM_USER_AGENT:
+        print("[!] ERROR: Faltan variables CM_COOKIE o CM_USER_AGENT.")
         return
 
-    if args.debug:
-        print(f"DEBUG: User-Agent usado: {ua_to_use}")
-        print(f"DEBUG: Cookies usadas: {cookie_to_use[:50]}...")
+    if "PHPSESSID" not in CM_COOKIE:
+        print("[!] ATENCIÓN: No se detecta PHPSESSID en la cookie.")
+        print("    Tu navegador móvil podría estar ocultando la cookie de sesión.")
+        print("    Prueba a copiarla manualmente desde las herramientas de desarrollador o usa otro navegador (ej. Kiwi Browser).")
 
     existing_ids, all_rows = load_existing_data()
     start_dt = datetime(int(args.year), 1, 1) if args.year else None
 
     with requests.Session() as s:
-        print("[*] Verificando conexión...")
-        headers = get_headers(ua_to_use, cookie_to_use)
+        print("[*] Verificando sesión...")
+        headers = get_headers(CM_USER_AGENT, CM_COOKIE)
         
         try:
             check = s.get("https://www.cardmarket.com/en/Magic/Orders/Received", headers=headers, timeout=10)
-            
             if 'Logout' in check.text:
-                print("[+] ACCESO CONCEDIDO.")
+                print("[+] SESIÓN ACTIVA. Iniciando exportación...")
             else:
-                print("[!] FALLO DE VALIDACIÓN")
                 print_debug_log(check)
                 return
         except Exception as e:
-            print(f"[!] Error de red: {e}")
+            print(f"[!] Error conexión: {e}")
             return
 
         new_items = []
         if args.include_purchases:
-            new_items.extend(scrape_section(s, "https://www.cardmarket.com/en/Magic/Orders/Received", start_dt, existing_ids, ua_to_use, cookie_to_use))
+            new_items.extend(scrape_section(s, "https://www.cardmarket.com/en/Magic/Orders/Received", start_dt, existing_ids, CM_USER_AGENT, CM_COOKIE))
         if args.include_sales:
-            new_items.extend(scrape_section(s, "https://www.cardmarket.com/en/Magic/Sales/Sent", start_dt, existing_ids, ua_to_use, cookie_to_use))
+            new_items.extend(scrape_section(s, "https://www.cardmarket.com/en/Magic/Sales/Sent", start_dt, existing_ids, CM_USER_AGENT, CM_COOKIE))
 
         if new_items:
             all_rows.extend(new_items)
@@ -189,9 +174,9 @@ def run():
                 writer = csv.DictWriter(f, fieldnames=keys)
                 writer.writeheader()
                 writer.writerows(all_rows)
-            print(f"[+] ÉXITO: {len(new_items)} pedidos nuevos guardados.")
+            print(f"[+] Exportación finalizada con {len(new_items)} nuevos registros.")
         else:
-            print("[*] No hay pedidos nuevos.")
+            print("[*] No hay datos nuevos que exportar.")
 
 if __name__ == "__main__":
     run()
